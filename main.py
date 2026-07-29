@@ -1,4 +1,6 @@
-from maix import camera, display, image, nn, app, time, sys
+from maix import (camera, display, image, nn, app, time, sys,
+                 uart,pinmap,err
+)
 
 from ball_position import (
     AdaptiveAlphaBetaFilter,
@@ -37,9 +39,9 @@ LENS_CORR_STRENGTH=0.6
 # 钢珠位置两点标定。固定摄像头后，把钢珠分别放在两个已知刻度上，
 # 将检测框中心像素和实际刻度填写到这里。起点为负方向，终点为正方向。
 # 以下像素值仅为初始示例，使用前必须实测。
-AXIS_START_PX = (40, 112)
+AXIS_START_PX = (40, 112)#(初始的位置像素点)
 AXIS_END_PX = (280, 112)
-AXIS_START_CM = 0       # cm
+AXIS_START_CM = 0       # cm(比赛坐标零点)
 AXIS_END_CM = 25          # cm
 DETECTION_CONFIDENCE = 0.50
 
@@ -59,13 +61,52 @@ def model_path_for_device(device_name):
         return MAIXCAM_MODEL_PATH
     raise ValueError("unsupported device: {}".format(device_name))
 
+def uart_config_for_device(device_name):
+    """根据设备型号返回 UART引脚和设备路径。"""
+    normalized_name = device_name.strip().lower()
 
-model = model_path_for_device(sys.device_name())
+    if normalized_name == "maixcam2":
+        pin_function = {
+            "A21": "UART4_TX",
+            "A22": "UART4_RX",
+        }
+        uart_device = "/dev/ttyS4"
+
+    elif normalized_name in ("maixcam", "maixcam-pro", "maixcam_pro"):
+        pin_function = {
+            "A19": "UART1_TX",
+            "A18": "UART1_RX",
+        }
+        uart_device = "/dev/ttyS1"
+
+    else:
+        raise ValueError(
+            "unsupported UART device: {}".format(device_name)
+        )
+
+    return pin_function, uart_device
+
+
+current_device_name = sys.device_name()
+
+model = model_path_for_device(current_device_name)
 
 detector = nn.YOLO26(
     model=model,
     dual_buff=not LOW_LATENCY_MODE,
 )
+
+pin_function, uart_device = uart_config_for_device(
+    current_device_name
+)
+
+for pin, function in pin_function.items():
+    err.check_raise(
+        pinmap.set_pin_function(pin, function),
+        "Failed to set {} to {}".format(pin, function),
+    )
+
+serial = uart.UART(uart_device, 115200)
 
 AXIS_START_PX = (5, detector.input_height() // 2)
 AXIS_END_PX = (detector.input_width() - 5, detector.input_height() // 2)
@@ -192,8 +233,8 @@ while not app.need_exit():
         #   frame_time_ms = now_ms            本次结果的时间戳，单位：毫秒
         #
         # 如果使用文本串口协议，可以在初始化好 serial 后取消下面两行的注释：
-        # tx_data = f"$BALL,1,{position_cm:.2f},{position_filter.vx:.1f},{ball.score:.2f},{now_ms}*\n"
-        # serial.write_str(tx_data)
+        tx_data = f"$BALL,1,{position_cm:.2f},{position_filter.vx:.1f},{ball.score:.2f},{now_ms}*\n"
+        serial.write_str(tx_data)
     else:
         position_filter.mark_missing(now_ms)
 
