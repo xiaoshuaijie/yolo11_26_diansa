@@ -1,0 +1,4 @@
+interface:
+  display_name: "MaixPy"
+  short_description: "Develop, run, and debug MaixPy/MaixCDK apps on MaixCAM-family devices."
+  default_prompt: "帮我在 MaixCAM/MaixCAM Pro/MaixCAM2 设备上开发并运行一个 MaixPy 或 MaixCDK 应用。"
