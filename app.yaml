@@ -1,0 +1,12 @@
+id: ball_position
+name: Ball Position
+name[zh]: 钢珠位置
+version: 0.1.0
+icon:
+author: liuargo
+desc: Detect and display the calibrated position of a steel ball.
+desc[zh]: 检测并显示钢珠在摆杆上的标定位置。
+files:
+  - main.py
+  - ball_position.py
+  - models
