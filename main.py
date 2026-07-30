@@ -1,3 +1,5 @@
+import struct
+
 from maix import (camera, display, image, nn, app, time, sys,
                  uart,pinmap,err
 )
@@ -41,9 +43,49 @@ LENS_CORR_STRENGTH=0.6
 # 以下像素值仅为初始示例，使用前必须实测。
 AXIS_START_PX = (40, 112)#(初始的位置像素点)
 AXIS_END_PX = (280, 112)
-AXIS_START_CM = 0       # cm(比赛坐标零点)
-AXIS_END_CM = 25          # cm
+AXIS_START_CM = -12.5       # cm(比赛坐标零点)
+AXIS_END_CM = 12.5          # cm
 DETECTION_CONFIDENCE = 0.50
+
+# STM32 UART 固定长度二进制帧（小端序，13 字节）：
+# [0..1]  0xAA, 0x55      帧头
+# [2]     valid           1: 检测到钢珠，0: 未检测到
+# [3..4]  x_cm_x100       int16，位置（厘米）乘以 100
+# [5..6]  vx_px_s_x10     int16，速度（像素/秒）乘以 10
+# [7]     confidence_pct  uint8，置信度百分比（0 到 100）
+# [8..11] frame_time_ms   uint32，时间戳（毫秒）
+# [12]    checksum        [0..11] 所有字节的 XOR 校验
+UART_FRAME_HEAD = b"\xAA\x55"
+UART_FRAME_SIZE = 13
+
+
+def clamp_int(value, lower, upper):
+    return max(lower, min(upper, int(round(value))))
+
+
+def build_ball_uart_frame(valid, x_cm, vx_pixel_s, confidence, frame_time_ms):
+    """Build the fixed 13-byte ball-data UART frame."""
+    if not valid:
+        x_cm = 0
+        vx_pixel_s = 0
+        confidence = 0
+
+    payload = struct.pack(
+        "<BhhBI",
+        1 if valid else 0,
+        clamp_int(x_cm * 100, -32768, 32767),
+        clamp_int(vx_pixel_s * 10, -32768, 32767),
+        clamp_int(confidence * 100, 0, 100),
+        int(frame_time_ms) & 0xFFFFFFFF,
+    )
+    frame = bytearray(UART_FRAME_HEAD + payload)
+    checksum = 0
+    for byte in frame:
+        checksum ^= byte
+    frame.append(checksum)
+    if len(frame) != UART_FRAME_SIZE:
+        raise RuntimeError("unexpected UART frame size")
+    return bytes(frame)
 
 # 根据设备选择对应模型；不支持的设备直接报错，避免误加载模型。
 # MAIXCAM_MODEL_PATH = "models/yolo26_ball_my_maixcam_maixcam_yolo26/yolo26_ball_my_maixcam.mud"
@@ -224,17 +266,14 @@ while not app.need_exit():
             color=image.COLOR_WHITE, scale=1.4, thickness=2,
         )
 
-        # ==================== 在这里向主控发送数据 ====================
-        # 建议每次识别成功都发送以下信息：
-        #   valid = 1                         当前钢珠坐标有效
-        #   x_cm = position_cm                沿摆杆轴线的位置，单位：厘米
-        #   vx_pixel_s = position_filter.vx   估算的横向像素速度，单位：像素/秒
-        #   confidence = ball.score           YOLO 检测置信度
-        #   frame_time_ms = now_ms            本次结果的时间戳，单位：毫秒
-        #
-        # 如果使用文本串口协议，可以在初始化好 serial 后取消下面两行的注释：
-        tx_data = f"$BALL,1,{position_cm:.2f},{position_filter.vx:.1f},{ball.score:.2f},{now_ms}*\n"
-        serial.write_str(tx_data)
+        # 发送固定 13 字节二进制帧，字段和 STM32 接收方式见 STM32_UART_PROTOCOL.md。
+        serial.write(build_ball_uart_frame(
+            True,
+            position_cm,
+            position_filter.vx,
+            ball.score,
+            now_ms,
+        ))
     else:
         position_filter.mark_missing(now_ms)
 
@@ -244,10 +283,8 @@ while not app.need_exit():
             color=image.COLOR_RED, scale=1.4, thickness=2,
         )
 
-        # ==================== 丢检时也要向主控发送 ====================
-        # 应发送 valid=0，明确告诉主控当前坐标无效；不能继续把旧坐标当成新数据。
-        # 文本协议示例：
-        # serial.write_str(f"$BALL,0,0,0,0,{now_ms}*\n")
+        # 丢检时同样发送固定帧；valid=0 且其余数值均为 0，避免主控误用旧坐标。
+        serial.write(build_ball_uart_frame(False, 0, 0, 0, now_ms))
 
     fps_str = "FPS:" + str(0 if loop_ms == 0 else 1000//loop_ms)
     img.draw_string(
