@@ -1,6 +1,6 @@
 [basic]
 type = cvimodel
-model = yolo26_all.cvimodel
+model = yolo26_ball_my.cvimodel
 
 [extra]
 model_type = yolo26

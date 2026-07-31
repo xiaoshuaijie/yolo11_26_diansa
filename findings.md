@@ -12,6 +12,7 @@
 - 连续两帧实时画面中没有可见钢珠，但叠加层持续显示 `BALL -10.93cm T`，其中 `T` 是 OpenCV 模板跟踪来源；黄色检测框落在车架/安装结构的静态区域。这是模板阈值过宽或错误模板被保留导致的实机误检。
 - `E:\jie` 与 MaixVision 打开的 `C:\Users\24137\Downloads\H_demo_hybrid\H_demo_hybrid` 是不同目录；三份运行文件在调整前哈希相同，因此本轮把检测器改动同步到两处，保证 IDE 复测的是更新后的代码。
 - 用户标出的白色导轨内侧端点对应当前 `480px` 画面的约 `x=21` 与 `x=460`；原来 `(5,80)` 到 `(475,80)` 的青色十字落在画面边缘之外的安装区域。
+- 本机映射验证确认：`position_from_pixel((21,80)) == -12.5cm`，`position_from_pixel((460,80)) == +12.5cm`；运行副本与工作区副本哈希一致。
 
 ## Technical Decisions
 | Decision | Rationale |

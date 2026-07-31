@@ -21,7 +21,7 @@ from hybrid_tracker import HybridBallTracker
 
 DEBUG_LOG = False
 DRAW_DEBUG = True
-SHOW_FPS = False
+SHOW_FPS = True
 USE_WEBRTC = True
 PRINT_PROTOCOL = False
 LENS_CORR_ENABLE = False
@@ -64,7 +64,7 @@ serial = uart.UART(UART_DEVICE, UART_BAUDRATE)
 # ============================== 模型与标定 ==============================
 
 MAIXCAM_MODEL_PATH = (
-    "/root/text/yolo26_all.mud"
+    "/root/text/yolo26_ball_my.mud"
 )
 MAIXCAM2_MODEL_PATH = (
     "models/yolo26_all_maixcam2_yolo26_640_160/yolo26_all.mud"
