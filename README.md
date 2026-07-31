@@ -1,23 +1,33 @@
-# E题
+# 混合钢珠位置识别
 
-这个代码可以用在maixcam和maixcam2上, 注意models包含了maixcam和maixcam2的模型, 如果不需要可以自行删除
+这是面向 MaixCAM、MaixCAM Pro 和 MaixCAM2 的 NPU + CPU 混合版本。
+它保留 YOLO 的语义识别能力，同时解决纯 OpenCV 全图圆检测卡顿、对绝对
+亮度门限敏感的问题。
 
-思路:
-1. 使用yolo26检测小球
-2. 固定maixcam到水管正上方, 固定水管, 计算小球在摄像头画面的像素位置, 反推出小球在水管上的位置
+## 实际执行顺序
 
-配置(可能没写全, 具体要自己看代码):
+1. `Y`：原始画面 YOLO26，正常情况下只执行这一步。
+2. `T`：YOLO 瞬时丢失时，在预测位置附近进行归一化模板跟踪。
+3. `E`：模板也失败时，根据画面平均亮度进行 gamma 或 CLAHE 处理，再用
+   YOLO 复检一次。
+4. `G`：每隔几帧在全画面执行一次归一化模板匹配，用于钢珠快速移动后
+   超出局部窗口的重定位；不执行全图 Hough 圆搜索。
 
--  是否开启推流, 推荐同时只开启一个, 默认使用webrtc
-USE_RTSP=False
-USE_JPEG=False
-USE_WEBRTC=True
+屏幕钢珠框旁的 `Y/T/E/G` 表示本帧结果来源。正常光线下应以 `Y` 为主；
+光线突变或短暂漏检时可能连续出现少量 `T` 或 `E`。
 
-- 输入打印. 关掉后提升帧率
-DEBUG_LOG=True
+## 使用
 
-- 畸变校准
-LENS_CORR_ENABLE=False
-LENS_CORR_STRENGTH=0.6
+在 MaixVision 中关闭旧项目后，打开本目录并运行全部文件。启动日志必须出现：
 
+```text
+Hybrid detector v1.0
+```
 
+程序根据设备名称自动加载 `models` 中对应的 480×160 或 640×160 模型。
+青色线只用于帮助安装和换算厘米位置，不限制钢珠必须位于线上。
+
+## 主控发送
+
+发送接口位于 `main.py` 的 `send_ball_result()`。初始化串口对象后，取消其中
+`serial.write_str(payload)` 的注释即可。本应用不参与运动控制。

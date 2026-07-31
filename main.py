@@ -1,8 +1,12 @@
+"""MaixCAM / MaixCAM2 钢珠混合识别与图传。
+
+正常帧使用 NPU YOLO26；丢失时才启用轻量模板跟踪、亮度归一化复检和
+低频全画面模板重定位。程序只识别和发送位置，不参与运动控制。
+"""
+
 import struct
 
-from maix import (camera, display, image, nn, app, time, sys,
-                 uart,pinmap,err
-)
+from maix import app, camera, display, err, image, nn, pinmap, sys, time, uart
 
 from ball_position import (
     AdaptiveAlphaBetaFilter,
@@ -10,72 +14,115 @@ from ball_position import (
     position_from_pixel,
     validate_calibration,
 )
+from hybrid_tracker import HybridBallTracker
 
-# 输入打印. 关掉后提升帧率
-DEBUG_LOG=False
 
-def print_debug(s):
-    if DEBUG_LOG:
-        print(s)
+# ============================== 功能开关 ==============================
 
-# 位置传感器更重视“采集到结果”的延迟，而不是最高吞吐帧率。
-# 低延迟模式下 dual_buff=False，每次检测结果都对应本次传入的图像。
-# 只有在测试最高检测帧率时，才建议把该开关改为 False。
+DEBUG_LOG = False
+DRAW_DEBUG = True
+SHOW_FPS = False
+USE_WEBRTC = True
+PRINT_PROTOCOL = False
+LENS_CORR_ENABLE = False
+LENS_CORR_STRENGTH = 0.6
+
+# dual_buff=False：检测结果对应当前输入帧，降低位置反馈延迟。
 LOW_LATENCY_MODE = True
 
-# RTSP流
-USE_RTSP=False
+# ============================== text ==============================
+def draw_calibration_grid(frame):
+    color = image.Color.from_rgb(80, 80, 80)
 
-# HTTP JPEG流
-USE_JPEG=False
+    for x in range(0, FRAME_WIDTH, 20):
+        frame.draw_line(x, 0, x, FRAME_HEIGHT - 1, color, 1)
+        frame.draw_string(x + 1, 1, str(x), color=color, scale=0.6)
 
-# WEBRTC流
-USE_WEBRTC=True
+    for y in range(0, FRAME_HEIGHT, 20):
+        frame.draw_line(0, y, FRAME_WIDTH - 1, y, color, 1)
+        frame.draw_string(1, y + 1, str(y), color=color, scale=0.6)
 
-# 使能畸变校准
-LENS_CORR_ENABLE=False
+# ============================== STM32 UART ==============================
 
-# 畸变校准强度
-LENS_CORR_STRENGTH=0.6
-
-# 钢珠位置两点标定。固定摄像头后，把钢珠分别放在两个已知刻度上，
-# 将检测框中心像素和实际刻度填写到这里。起点为负方向，终点为正方向。
-# 以下像素值仅为初始示例，使用前必须实测。
-AXIS_START_PX = (40, 112)#(初始的位置像素点)
-AXIS_END_PX = (280, 112)
-AXIS_START_CM = -12.5       # cm(比赛坐标零点)
-AXIS_END_CM = 12.5          # cm
-DETECTION_CONFIDENCE = 0.50
-
-# STM32 UART 固定长度二进制帧（小端序，13 字节）：
-# [0..1]  0xAA, 0x55      帧头
-# [2]     valid           1: 检测到钢珠，0: 未检测到
-# [3..4]  x_cm_x100       int16，位置（厘米）乘以 100
-# [5..6]  vx_px_s_x10     int16，速度（像素/秒）乘以 10
-# [7]     confidence_pct  uint8，置信度百分比（0 到 100）
-# [8..11] frame_time_ms   uint32，时间戳（毫秒）
-# [12]    checksum        [0..11] 所有字节的 XOR 校验
+UART_DEVICE = "/dev/ttyS0"
+UART_BAUDRATE = 115200
 UART_FRAME_HEAD = b"\xAA\x55"
 UART_FRAME_SIZE = 13
+
+for pin, function in {
+    "A16": "UART0_TX",
+    "A17": "UART0_RX",
+}.items():
+    err.check_raise(
+        pinmap.set_pin_function(pin, function),
+        "Failed to set {} to {}".format(pin, function),
+    )
+
+serial = uart.UART(UART_DEVICE, UART_BAUDRATE)
+
+
+# ============================== 模型与标定 ==============================
+
+MAIXCAM_MODEL_PATH = (
+    "/root/text/yolo26_all.mud"
+)
+MAIXCAM2_MODEL_PATH = (
+    "models/yolo26_all_maixcam2_yolo26_640_160/yolo26_all.mud"
+)
+
+
+def model_path_for_device(device_name):
+    normalized = device_name.strip().lower()
+    if normalized == "maixcam2":
+        return MAIXCAM2_MODEL_PATH
+    if normalized in ("maixcam", "maixcam-pro", "maixcam_pro"):
+        return MAIXCAM_MODEL_PATH
+    raise ValueError("unsupported device: {}".format(device_name))
+
+
+detector = nn.YOLO26(
+    model=model_path_for_device(sys.device_name()),
+    dual_buff=not LOW_LATENCY_MODE,
+)
+
+FRAME_WIDTH = detector.input_width()
+FRAME_HEIGHT = detector.input_height()
+
+# 青色线只帮助安装和完成厘米换算，不限制识别必须在线上。
+# AXIS_START_PX = (5, FRAME_HEIGHT // 2)
+# AXIS_END_PX = (FRAME_WIDTH - 5, FRAME_HEIGHT // 2)
+
+# 白色导轨的两个内侧端点；青色十字与实物红色标记对齐。
+AXIS_START_PX = (21, 80)     # 左端，-12.5 cm
+AXIS_END_PX = (460, 80)      # 右端，+12.5 cm
+AXIS_START_CM = -12.5
+AXIS_END_CM = 12.5
+
+
+def debug_print(message):
+    if DEBUG_LOG:
+        print(message)
 
 
 def clamp_int(value, lower, upper):
     return max(lower, min(upper, int(round(value))))
 
 
-def build_ball_uart_frame(valid, x_cm, vx_pixel_s, confidence, frame_time_ms):
-    """Build the fixed 13-byte ball-data UART frame."""
+def build_ball_uart_frame(
+    valid, position_cm, velocity_pixel_s, quality, frame_time_ms
+):
+    """Build the STM32 fixed-length, little-endian 13-byte frame."""
     if not valid:
-        x_cm = 0
-        vx_pixel_s = 0
-        confidence = 0
+        position_cm = 0.0
+        velocity_pixel_s = 0.0
+        quality = 0.0
 
     payload = struct.pack(
         "<BhhBI",
         1 if valid else 0,
-        clamp_int(x_cm * 100, -32768, 32767),
-        clamp_int(vx_pixel_s * 10, -32768, 32767),
-        clamp_int(confidence * 100, 0, 100),
+        clamp_int(position_cm * 100.0, -32768, 32767),
+        clamp_int(velocity_pixel_s * 10.0, -32768, 32767),
+        clamp_int(quality * 100.0, 0, 100),
         int(frame_time_ms) & 0xFFFFFFFF,
     )
     frame = bytearray(UART_FRAME_HEAD + payload)
@@ -83,159 +130,101 @@ def build_ball_uart_frame(valid, x_cm, vx_pixel_s, confidence, frame_time_ms):
     for byte in frame:
         checksum ^= byte
     frame.append(checksum)
+
     if len(frame) != UART_FRAME_SIZE:
         raise RuntimeError("unexpected UART frame size")
     return bytes(frame)
 
-# 根据设备选择对应模型；不支持的设备直接报错，避免误加载模型。
-# MAIXCAM_MODEL_PATH = "models/yolo26_ball_my_maixcam_maixcam_yolo26/yolo26_ball_my_maixcam.mud"
-# MAIXCAM_MODEL_PATH = "models/yolo26_ball_my_maixcam_maixcam_yolo26_480_256/yolo26_ball_my_maixcam.mud"
-MAIXCAM_MODEL_PATH = "models/yolo26_all_maixcam_yolo26_480_160/yolo26_all.mud"
 
-MAIXCAM2_MODEL_PATH = "models/yolo26_all_maixcam2_yolo26_640_160/yolo26_all.mud"
-
-def model_path_for_device(device_name):
-    """Return the checked-in YOLO26 model matching a Maix device name."""
-    normalized_name = device_name.strip().lower()
-    if normalized_name == "maixcam2":
-        return MAIXCAM2_MODEL_PATH
-    if normalized_name in ("maixcam", "maixcam-pro", "maixcam_pro"):
-        return MAIXCAM_MODEL_PATH
-    raise ValueError("unsupported device: {}".format(device_name))
-
-def uart_config_for_device(device_name):
-    """根据设备型号返回 UART引脚和设备路径。"""
-    normalized_name = device_name.strip().lower()
-
-    if normalized_name == "maixcam2":
-        pin_function = {
-            "A21": "UART4_TX",
-            "A22": "UART4_RX",
-        }
-        uart_device = "/dev/ttyS4"
-
-    elif normalized_name in ("maixcam", "maixcam-pro", "maixcam_pro"):
-        pin_function = {
-            "A19": "UART1_TX",
-            "A18": "UART1_RX",
-        }
-        uart_device = "/dev/ttyS1"
-
-    else:
-        raise ValueError(
-            "unsupported UART device: {}".format(device_name)
-        )
-
-    return pin_function, uart_device
-
-
-current_device_name = sys.device_name()
-
-model = model_path_for_device(current_device_name)
-
-detector = nn.YOLO26(
-    model=model,
-    dual_buff=not LOW_LATENCY_MODE,
-)
-
-pin_function, uart_device = uart_config_for_device(
-    current_device_name
-)
-
-for pin, function in pin_function.items():
-    err.check_raise(
-        pinmap.set_pin_function(pin, function),
-        "Failed to set {} to {}".format(pin, function),
+def send_ball_result(valid, position_cm, velocity_pixel_s, quality, now_ms):
+    """Send one STM32 fixed-length binary frame over UART0."""
+    frame = build_ball_uart_frame(
+        valid, position_cm, velocity_pixel_s, quality, now_ms
     )
+    serial.write(frame)
 
-serial = uart.UART(uart_device, 115200)
+    if PRINT_PROTOCOL:
+        print("BALL TX:", " ".join("{:02X}".format(byte) for byte in frame))
 
-AXIS_START_PX = (5, detector.input_height() // 2)
-AXIS_END_PX = (detector.input_width() - 5, detector.input_height() // 2)
 
-cam = camera.Camera(detector.input_width(), detector.input_height(), detector.input_format())
-disp = display.Display()
-position_filter = AdaptiveAlphaBetaFilter()
+def draw_installation_axis(frame):
+    axis_color = image.Color.from_rgb(0, 220, 255)
+    frame.draw_line(
+        AXIS_START_PX[0],
+        AXIS_START_PX[1],
+        AXIS_END_PX[0],
+        AXIS_END_PX[1],
+        axis_color,
+        2,
+    )
+    frame.draw_cross(AXIS_START_PX[0], AXIS_START_PX[1], axis_color, 7, 2)
+    frame.draw_cross(AXIS_END_PX[0], AXIS_END_PX[1], axis_color, 7, 2)
 
-if USE_RTSP:
-    from maix import rtsp
-    cam2 = cam.add_channel(320, 180, image.Format.FMT_YVU420SP)
-    server = rtsp.Rtsp()
-    server.bind_camera(cam2)
-    server.start()
-    print(server.get_url())
-
-if USE_JPEG:
-    from maix import http
-    jpeg_server = http.JpegStreamer()
-    jpeg_server.start()
-
-if USE_WEBRTC:
-    from maix import webrtc
-    cam2 = cam.add_channel(320, 180, image.Format.FMT_YVU420SP)
-    server = webrtc.WebRTC()
-    server.bind_camera(cam2)
-    server.start()
-    print(server.get_url())
 
 validate_calibration(
     AXIS_START_PX,
     AXIS_END_PX,
     AXIS_START_CM,
     AXIS_END_CM,
-    detector.input_width(),
-    detector.input_height(),
+    FRAME_WIDTH,
+    FRAME_HEIGHT,
 )
 
-print(detector.input_width(), detector.input_height())
+cam = camera.Camera(FRAME_WIDTH, FRAME_HEIGHT, detector.input_format())
+disp = display.Display()
+tracker = HybridBallTracker(detector, FRAME_WIDTH, FRAME_HEIGHT)
+position_filter = AdaptiveAlphaBetaFilter()
 
-axis_color = image.Color.from_rgb(0, 220, 255)
-zero_color = image.Color.from_rgb(255, 220, 0)
-panel_color = image.Color.from_rgb(0, 0, 0)
+webrtc_server = None
+if USE_WEBRTC:
+    from maix import webrtc
 
+    stream_channel = cam.add_channel(320, 180, image.Format.FMT_YVU420SP)
+    webrtc_server = webrtc.WebRTC()
+    webrtc_server.bind_camera(stream_channel)
+    webrtc_server.start()
+    print("WebRTC:", webrtc_server.get_url())
 
-def draw_calibration_axis(img):
-    img.draw_line(
-        AXIS_START_PX[0], AXIS_START_PX[1],
-        AXIS_END_PX[0], AXIS_END_PX[1],
-        axis_color, 2,
+print(
+    "Hybrid detector v1.0: {}x{}, model={}".format(
+        FRAME_WIDTH, FRAME_HEIGHT, model_path_for_device(sys.device_name())
     )
-    img.draw_cross(AXIS_START_PX[0], AXIS_START_PX[1], axis_color, 7, 2)
-    img.draw_cross(AXIS_END_PX[0], AXIS_END_PX[1], axis_color, 7, 2)
-    zero_ratio = (0.0 - AXIS_START_CM) / (AXIS_END_CM - AXIS_START_CM)
-    zero_x, zero_y = axis_point(zero_ratio, AXIS_START_PX, AXIS_END_PX)
-    img.draw_cross(int(zero_x), int(zero_y), zero_color, 9, 2)
+)
 
-last_ms = time.ticks_ms()
-loop_ms = 1000
+panel_color = image.Color.from_rgb(0, 0, 0)
+projection_color = image.Color.from_rgb(255, 220, 0)
+source_colors = {
+    "Y": image.COLOR_GREEN,                    # 原图 YOLO
+    "T": image.Color.from_rgb(255, 220, 0),   # 模板跟踪
+    "E": image.Color.from_rgb(0, 220, 255),   # 增强图 YOLO
+    "G": image.Color.from_rgb(255, 140, 0),   # 全画面模板重定位
+}
+last_loop_ms = time.ticks_ms()
+
+
 while not app.need_exit():
-    loop_ms = time.ticks_ms() - last_ms
-    print_debug("loop cost " + str(loop_ms) + "ms")
-    last_ms = time.ticks_ms()
+    loop_start_ms = time.ticks_ms()
+    loop_cost_ms = loop_start_ms - last_loop_ms
+    last_loop_ms = loop_start_ms
 
-    img = cam.read()
-    t = time.ticks_ms()
-
+    frame = cam.read()
     if LENS_CORR_ENABLE:
-        img = img.lens_corr(strength=LENS_CORR_STRENGTH)
-    print_debug("lens_corr cost " + str(time.ticks_ms() - t) + "ms")
+        frame = frame.lens_corr(strength=LENS_CORR_STRENGTH)
 
-    t = time.ticks_ms()
-    objs = detector.detect(img, conf_th=DETECTION_CONFIDENCE, iou_th=0.45)
-    print_debug("detect cost " + str(time.ticks_ms() - t) + "ms")
-
-    t = time.ticks_ms()
+    detect_start_ms = time.ticks_ms()
     now_ms = time.ticks_ms()
-    draw_calibration_axis(img)
+    ball, debug = tracker.process(frame, now_ms)
+    detect_cost_ms = time.ticks_ms() - detect_start_ms
 
-    # 模型只有 steel_ball 一个类别。如果一帧出现多个框，只选择置信度最高的框，
-    # 避免多个误检框同时干扰位置滤波器。
-    ball = max(objs, key=lambda obj: obj.score) if objs else None
+    # draw_calibration_grid(frame)
+    draw_installation_axis(frame)
+    frame.draw_rect(0, 0, FRAME_WIDTH, 34, panel_color, -1)
+
     if ball is not None:
-        raw_x = ball.x + ball.w * 0.5
-        raw_y = ball.y + ball.h * 0.5
-        filtered_x, filtered_y = position_filter.update(raw_x, raw_y, now_ms)
-        position_cm, axis_ratio, _axis_distance = position_from_pixel(
+        filtered_x, filtered_y = position_filter.update(
+            ball["cx"], ball["cy"], now_ms
+        )
+        position_cm, axis_ratio, _ = position_from_pixel(
             (filtered_x, filtered_y),
             AXIS_START_PX,
             AXIS_END_PX,
@@ -246,53 +235,105 @@ while not app.need_exit():
             axis_ratio, AXIS_START_PX, AXIS_END_PX
         )
 
-        img.draw_rect(ball.x, ball.y, ball.w, ball.h, color=image.COLOR_GREEN, thickness=2)
-
-        if DEBUG_LOG:
-            img.draw_cross(
-                int(filtered_x), int(filtered_y), image.COLOR_GREEN, 12, 2
-            )
-            img.draw_cross(
-                int(projected_x), int(projected_y), zero_color, 7, 2
-            )
-            msg = (
-                f"{detector.labels[ball.class_id]}: {ball.score:.2f} "
-                f"px=({filtered_x:.1f},{filtered_y:.1f})"
-            )
-            img.draw_string(ball.x, ball.y, msg, color=image.COLOR_RED)
-            img.draw_rect(0, 0, detector.input_width(), 35, panel_color, -1)
-        img.draw_string(
-            8, 5, f"BALL {position_cm:+.2f} cm",
-            color=image.COLOR_WHITE, scale=1.4, thickness=2,
+        source = ball["source"]
+        box_color = source_colors.get(source, image.COLOR_GREEN)
+        draw_x = max(0, int(ball["x"]))
+        draw_y = max(0, int(ball["y"]))
+        draw_w = max(1, min(FRAME_WIDTH - draw_x, int(ball["w"])))
+        draw_h = max(1, min(FRAME_HEIGHT - draw_y, int(ball["h"])))
+        frame.draw_rect(draw_x, draw_y, draw_w, draw_h, box_color, 2)
+        frame.draw_cross(
+            int(round(filtered_x)), int(round(filtered_y)), box_color, 9, 2
+        )
+        frame.draw_cross(
+            int(round(projected_x)),
+            int(round(projected_y)),
+            projection_color,
+            6,
+            2,
         )
 
-        # 发送固定 13 字节二进制帧，字段和 STM32 接收方式见 STM32_UART_PROTOCOL.md。
-        serial.write(build_ball_uart_frame(
+        frame.draw_string(
+            8,
+            5,
+            "BALL {:+.2f}cm {}".format(position_cm, source),
+            color=image.COLOR_WHITE,
+            scale=1.25,
+            thickness=2,
+        )
+
+        if DRAW_DEBUG:
+            debug_text = "{} Q{:.2f} Y{} T{:.2f} {}ms".format(
+                source,
+                ball["score"],
+                debug["raw_objects"],
+                debug["template_score"],
+                detect_cost_ms,
+            )
+            text_y = min(FRAME_HEIGHT - 18, draw_y + draw_h + 2)
+            frame.draw_string(
+                max(0, min(draw_x, FRAME_WIDTH - 205)),
+                text_y,
+                debug_text,
+                color=box_color,
+                scale=0.8,
+                thickness=1,
+            )
+
+        send_ball_result(
             True,
             position_cm,
             position_filter.vx,
-            ball.score,
+            ball["score"],
             now_ms,
-        ))
+        )
     else:
         position_filter.mark_missing(now_ms)
+        frame.draw_string(
+            8,
+            5,
+            "BALL LOST",
+            color=image.COLOR_RED,
+            scale=1.25,
+            thickness=2,
+        )
+        if DRAW_DEBUG:
+            # Y=原图框数，E=增强图框数，T=局部模板，G=全画面模板。
+            debug_text = "Y{} E{} T{:.2f} G{:.2f} {}ms".format(
+                debug["raw_objects"],
+                debug["enhanced_objects"],
+                debug["template_score"],
+                debug["global_template_score"],
+                detect_cost_ms,
+            )
+            frame.draw_string(
+                8,
+                38,
+                debug_text,
+                color=image.Color.from_rgb(255, 170, 0),
+                scale=0.8,
+                thickness=1,
+            )
+        send_ball_result(False, 0.0, 0.0, 0.0, now_ms)
 
-        img.draw_rect(0, 0, detector.input_width(), 35, panel_color, -1)
-        img.draw_string(
-            8, 5, "BALL LOST",
-            color=image.COLOR_RED, scale=1.4, thickness=2,
+    if SHOW_FPS:
+        fps = 0 if loop_cost_ms <= 0 else int(1000 / loop_cost_ms)
+        fps_text = "FPS:{}".format(fps)
+        text_width = image.string_size(
+            fps_text, scale=1.0, thickness=1
+        ).width()
+        frame.draw_string(
+            FRAME_WIDTH - text_width - 5,
+            6,
+            fps_text,
+            color=image.COLOR_GREEN,
+            scale=1.0,
+            thickness=1,
         )
 
-        # 丢检时同样发送固定帧；valid=0 且其余数值均为 0，避免主控误用旧坐标。
-        serial.write(build_ball_uart_frame(False, 0, 0, 0, now_ms))
-
-    fps_str = "FPS:" + str(0 if loop_ms == 0 else 1000//loop_ms)
-    img.draw_string(
-        img.width() - image.string_size(fps_str, scale=1.4, thickness=2).width(), 5, fps_str,
-        color=image.COLOR_GREEN, scale=1.4, thickness=2,
+    debug_print(
+        "source={} detect={}ms loop={}ms".format(
+            debug["source"], detect_cost_ms, loop_cost_ms
+        )
     )
-    print_debug("draw and get position cost " + str(time.ticks_ms() - t) + "ms")
-
-    if USE_JPEG:
-        jpeg_server.write(img)
-    disp.show(img)
+    disp.show(frame)

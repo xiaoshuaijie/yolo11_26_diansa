@@ -1,14 +1,13 @@
-id: jie_ball
-name: jie
-name[zh]: 钢珠位置
+id: ball_position_hybrid
+name: Ball Position Hybrid
+name[zh]: 混合钢珠位置
 version: 1.0.0
-icon: app.png
+icon:
 author: liuargo
-desc: demo
-desc[zh]: 检测并显示钢珠在摆杆上的标定位置。
+desc: Low-latency NPU and CPU hybrid steel-ball tracking.
+desc[zh]: 使用 NPU YOLO、模板跟踪和亮度自适应识别钢珠。
 files:
-  - models\yolo26_all_maixcam_yolo26_480_160\yolo26_all_tensor_info.txt
-  - models\yolo26_all_maixcam_yolo26_480_160\yolo26_all.cvimodel
-  - models\yolo26_all_maixcam_yolo26_480_160\yolo26_all.mud
-  - ball_position.py
   - main.py
+  - ball_position.py
+  - hybrid_tracker.py
+  - models
