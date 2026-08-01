@@ -2,12 +2,17 @@ id: ball_position_hybrid
 name: Ball Position Hybrid
 name[zh]: 混合钢珠位置
 version: 1.0.0
-icon:
+icon: ''
 author: liuargo
 desc: Low-latency NPU and CPU hybrid steel-ball tracking.
 desc[zh]: 使用 NPU YOLO、模板跟踪和亮度自适应识别钢珠。
 files:
-  - main.py
+  - models\yolo26_all_maixcam_yolo26_480_96\best_tensor_info.txt
+  - models\yolo26_all_maixcam_yolo26_480_96\best.cvimodel
+  - models\yolo26_all_maixcam_yolo26_480_96\best.mud
+  - models\yolo26_all_maixcam2_yolo26_640_160\yolo26_all_npu.axmodel
+  - models\yolo26_all_maixcam2_yolo26_640_160\yolo26_all_vnpu.axmodel
+  - models\yolo26_all_maixcam2_yolo26_640_160\yolo26_all.mud
   - ball_position.py
   - hybrid_tracker.py
-  - models
+  - main.py

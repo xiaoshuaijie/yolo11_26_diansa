@@ -64,7 +64,7 @@ serial = uart.UART(UART_DEVICE, UART_BAUDRATE)
 # ============================== 模型与标定 ==============================
 
 MAIXCAM_MODEL_PATH = (
-    "/root/text/yolo26_ball_my.mud"
+    "/root/text/best.mud"
 )
 MAIXCAM2_MODEL_PATH = (
     "models/yolo26_all_maixcam2_yolo26_640_160/yolo26_all.mud"
